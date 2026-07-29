@@ -1,0 +1,12 @@
+{
+  "name": "MOTD",
+  "description": "Message-of-the-day system summary on shell login: OS/kernel/uptime/CPU/RAM, CPU temps, Docker container status, drive usage, service status, and network interfaces.",
+  "category": [ "Monitoring" ],
+  "repository": "https://github.com/websterwh/mos-motd",
+  "architecture": [ "amd64", "arm64" ],
+  "driver": false,
+  "readme_url": "https://github.com/websterwh/mos-motd#readme",
+  "author": "websterwh",
+  "homepage": "https://github.com/websterwh/mos-motd",
+  "support": "https://github.com/websterwh/mos-motd/issues"
+}

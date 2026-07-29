@@ -1,0 +1,188 @@
+#!/bin/bash
+#
+# MOS plugin functions for motd.
+#
+# MOS automatically calls install / uninstall / plugin_update / mos_start /
+# mos_osupdate when present. See:
+#   https://github.com/ich777/mos-docs/blob/master/docs/Plugins/MOS-Plugin-Development-Guide.md
+#
+# The motd binary itself is installed by MOS Hub from this repo's released
+# .deb package (built by .github/workflows/release.yml) directly to
+# /usr/bin/plugins/motd -- this script does NOT download it. install()/
+# uninstall() here only handle things the .deb's own postinst/postrm don't:
+# the optional figurine ASCII-art renderer (a separate upstream project,
+# not something we redistribute in our own package), the /etc/profile.d
+# login hook, and a default config.yaml on first install.
+#
+# NOTE on config sync: MOS's plugin settings API (GET/POST
+# /api/v1/mos/plugins/settings/motd) reads/writes ${CONFIG_DIR}/settings.json
+# -- a *different* file from ${CONFIG_DIR}/config.yaml, which is the one the
+# motd binary actually reads at runtime. The settings page's Save button
+# calls the "apply_config" custom function below (via
+# /api/v1/mos/plugins/executefunction) right after saving, which copies
+# settings.json's "config" field into config.yaml so the change actually
+# takes effect on next login. This file-path assumption is inferred from
+# ich777/mos-backup's functions script (which reads its own settings.json the
+# same way) and hasn't been independently confirmed against MOS's source.
+
+PLUGIN_BIN_DIR="/usr/bin/plugins"
+CONFIG_DIR="/boot/optional/plugins/motd"
+PROFILE_SCRIPT="/etc/profile.d/motd.sh"
+FIGURINE_VERSION="v1.3.0"
+
+_arch() {
+	case "$(uname -m)" in
+		x86_64) echo "amd64" ;;
+		aarch64|arm64) echo "arm64" ;;
+		*) echo "amd64" ;;
+	esac
+}
+
+_install_figurine() {
+	local arch figurine_url
+	arch="$(_arch)"
+	figurine_url="https://github.com/arsham/figurine/releases/download/${FIGURINE_VERSION}/figurine_linux_${arch}_${FIGURINE_VERSION#v}.tar.gz"
+	if curl -fsSL "$figurine_url" -o /tmp/figurine.tar.gz 2>/dev/null; then
+		tar xf /tmp/figurine.tar.gz -C "$PLUGIN_BIN_DIR" --strip-components=1 deploy/figurine 2>/dev/null
+		chmod +x "${PLUGIN_BIN_DIR}/figurine" 2>/dev/null
+		rm -f /tmp/figurine.tar.gz
+		ln -sf "${PLUGIN_BIN_DIR}/figurine" /usr/local/bin/figurine 2>/dev/null
+	else
+		echo "motd: figurine header font renderer not installed (optional, header will be skipped)"
+	fi
+}
+
+# Copy settings.json's "config" field (written by the MOS settings API when
+# the web UI's Save button is clicked) into the real config.yaml the binary
+# reads. Called via executefunction from Plugin.vue right after a save.
+apply_config() {
+	local cfg
+	cfg=$(jq -r '.config // empty' "${CONFIG_DIR}/settings.json" 2>/dev/null)
+	if [ -z "$cfg" ]; then
+		echo "motd: no config found in settings.json, nothing to apply" >&2
+		return 1
+	fi
+	printf '%s' "$cfg" > "${CONFIG_DIR}/config.yaml"
+	echo "motd: applied config from settings.json to config.yaml"
+}
+
+# Force-writes settings.json from whatever config.yaml currently holds,
+# regardless of what settings.json had before. Used by reset_config, and by
+# _ensure_config the first time settings.json doesn't exist yet.
+_write_settings_from_config() {
+	if [ -f "${CONFIG_DIR}/config.yaml" ]; then
+		jq -n --arg config "$(cat "${CONFIG_DIR}/config.yaml")" '{config: $config}' \
+			> "${CONFIG_DIR}/settings.json" 2>/dev/null \
+			|| echo "motd: failed to write settings.json from config.yaml" >&2
+	fi
+}
+
+# Seed settings.json from the current config.yaml so the web UI shows the
+# real on-disk config instead of the static "config": "" template. Only runs
+# when settings.json doesn't already have a non-empty config, so it won't
+# clobber anything already saved through the UI -- safe to call on every
+# install and update.
+_seed_settings_from_config() {
+	local existing
+	existing=$(jq -r '.config // empty' "${CONFIG_DIR}/settings.json" 2>/dev/null)
+	if [ -n "$existing" ]; then
+		return 0
+	fi
+	_write_settings_from_config
+}
+
+# Makes sure a config.yaml exists, writing the binary's defaults only if
+# missing -- never overwrites an existing (i.e. user-customized) config.
+# Called on both install and plugin_update, so a fresh install after
+# uninstall (which now removes config.yaml) or an update that finds no
+# config for any other reason both still end up with a working config.
+_ensure_config() {
+	mkdir -p "$CONFIG_DIR"
+	if [ ! -f "${CONFIG_DIR}/config.yaml" ]; then
+		if ! "${PLUGIN_BIN_DIR}/motd" --dump-config --dump-config-path "${CONFIG_DIR}/config.yaml" </dev/null; then
+			echo "motd: failed to write default config.yaml" >&2
+		fi
+	fi
+	_seed_settings_from_config
+}
+
+# Overwrites config.yaml with the binary's defaults, discarding any custom
+# config, and syncs settings.json to match. Called via executefunction from
+# the settings page's "Reset to Default" button.
+reset_config() {
+	if ! "${PLUGIN_BIN_DIR}/motd" --dump-config --dump-config-path "${CONFIG_DIR}/config.yaml" </dev/null; then
+		echo "motd: failed to reset config" >&2
+		return 1
+	fi
+	_write_settings_from_config
+	echo "motd: config reset to defaults"
+}
+
+# Writes/overwrites the login hook script. --login tells the binary this is
+# the automatic invocation, so global.enabled: false in config.yaml can
+# silence it without affecting direct runs or the settings page's Preview
+# MOTD button (neither of which pass --login). Called from both install()
+# and plugin_update() so existing installs pick up the --login flag on
+# upgrade too, not just fresh installs.
+_write_profile_script() {
+	cat > "$PROFILE_SCRIPT" <<'EOF'
+#!/bin/sh
+/usr/bin/plugins/motd --login
+EOF
+	chmod +x "$PROFILE_SCRIPT"
+}
+
+# Creates /var/log/wtmp if it's missing, so the last-login module has
+# something to read. On some minimal/embedded installs, nothing ever creates
+# this file's initial (empty) copy even though PAM/sshd would otherwise
+# append to it once it exists -- glibc's wtmp-writing calls don't always
+# create it themselves. This is harmless to run repeatedly (no-ops once the
+# file exists) and doesn't retroactively add missed history, but it removes
+# one possible blocker for future logins to start showing up. If last-login
+# is still "Unavailable" after this, session accounting itself likely isn't
+# enabled (check `UsePAM` in /etc/ssh/sshd_config and whether pam_lastlog is
+# wired into /etc/pam.d/sshd), which is outside anything this plugin can fix.
+_ensure_wtmp() {
+	if [ ! -f /var/log/wtmp ]; then
+		touch /var/log/wtmp 2>/dev/null
+		chmod 664 /var/log/wtmp 2>/dev/null
+		chgrp utmp /var/log/wtmp 2>/dev/null
+	fi
+}
+
+install() {
+	_ensure_config
+
+	_install_figurine
+
+	_write_profile_script
+
+	_ensure_wtmp
+
+	echo "motd: installed"
+}
+
+uninstall() {
+	rm -f "${PLUGIN_BIN_DIR}/figurine"
+	rm -f /usr/local/bin/figurine
+	rm -f "$PROFILE_SCRIPT"
+	rm -rf "$CONFIG_DIR"
+	echo "motd: uninstalled"
+}
+
+plugin_update() {
+	_install_figurine
+	_ensure_config
+	_write_profile_script
+	_ensure_wtmp
+}
+
+mos_start() {
+	# Nothing to start; motd runs on-demand at login via /etc/profile.d.
+	:
+}
+
+mos_osupdate() {
+	# Binary has no kernel/OS-version dependency, nothing to rebuild.
+	:
+}

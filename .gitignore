@@ -1,0 +1,15 @@
+go-motd
+test
+.vscode
+*.log
+vendor
+.idea
+*.old
+tools/*.toml
+tools/*.yaml
+tools/tools
+build/
+node_modules/
+page/dist/
+*.deb
+*.deb.md5
